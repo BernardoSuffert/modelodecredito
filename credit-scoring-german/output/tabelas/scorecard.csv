@@ -1,0 +1,32 @@
+"variavel","faixa","n_treino","taxa_maus","woe","pontos"
+"conta_corrente","0 a 200 DM",187,0.412,-0.487,53
+"conta_corrente","200 DM ou mais",50,0.2,0.508,75
+"conta_corrente","negativa",185,0.486,-0.788,46
+"conta_corrente","sem conta",278,0.119,1.15,90
+"historico_credito","atraso no passado",61,0.311,-0.063,62
+"historico_credito","conta crítica ou créditos em outros bancos",203,0.177,0.682,80
+"historico_credito","créditos atuais em dia",369,0.304,-0.014,64
+"historico_credito","sem créditos ou todos quitados + todos quitados neste banco",67,0.642,-1.416,30
+"finalidade","carro novo",165,0.382,-0.36,53
+"finalidade","carro usado + requalificação",82,0.146,0.891,90
+"finalidade","educação + outros",50,0.48,-0.761,42
+"finalidade","eletrodomésticos + móveis",130,0.346,-0.208,58
+"finalidade","negócios + reparos",76,0.355,-0.251,57
+"finalidade","rádio/TV",197,0.198,0.55,80
+"poupanca","100 a 500 DM",74,0.365,-0.294,57
+"poupanca","1000 DM ou mais",35,0.143,0.872,84
+"poupanca","500 a 1000 DM",42,0.167,0.714,80
+"poupanca","desconhecida ou sem",135,0.17,0.725,80
+"poupanca","menos de 100 DM",414,0.357,-0.256,58
+"propriedade","carro ou outro",231,0.303,-0.013,64
+"propriedade","imóvel",199,0.186,0.624,75
+"propriedade","nenhuma ou desconhecida",110,0.445,-0.625,52
+"propriedade","seguro de vida ou poupança habitacional",160,0.338,-0.172,61
+"valor_credito","(-Inf,2860.2]",420,0.26,0.202,71
+"valor_credito","(2860.2,4738]",140,0.286,0.066,66
+"valor_credito","(4738, Inf]",140,0.436,-0.587,43
+"idade","(-Inf,31]",298,0.362,-0.282,56
+"idade","(31, Inf]",402,0.254,0.231,70
+"taxa_parcela","(-Inf,2.5]",263,0.262,0.186,77
+"taxa_parcela","(2.5,3.5]",101,0.297,0.009,65
+"taxa_parcela","(3.5, Inf]",336,0.33,-0.139,54

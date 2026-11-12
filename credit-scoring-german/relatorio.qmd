@@ -1,0 +1,403 @@
+---
+title: "Credit scoring com regressão logística, WoE/IV e KS"
+subtitle: "Base German Credit (UCI)"
+author: "Bernardo"
+date: today
+lang: pt-BR
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-title: "Conteúdo"
+    number-sections: true
+    code-fold: true
+    code-summary: "Ver código"
+    embed-resources: true
+    theme: cosmo
+    df-print: kable
+    fig-width: 8
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: preparo
+#| include: false
+library(ggplot2)
+source("R/00_funcoes.R")
+source("R/02_features.R")
+
+# O relatório lê os resultados gerados pelo pipeline. Se ainda não existirem,
+# roda o projeto inteiro antes (cerca de 15 segundos).
+if (!file.exists("data/processed/pipeline_final.rds") ||
+    !file.exists("output/tabelas/cv_detalhe.csv")) {
+  source("run_all.R")
+}
+
+dados  <- criar_features(readRDS("data/processed/dados.rds"))
+pipe   <- readRDS("data/processed/pipeline_final.rds")
+treino <- dados[dados$base == "treino", ]
+teste  <- dados[dados$base == "teste", ]
+
+ler <- function(nome) read.csv(file.path("output/tabelas", nome),
+                               stringsAsFactors = FALSE, check.names = FALSE)
+iv      <- ler("iv.csv")
+woe_tab <- ler("woe_por_faixa.csv")
+cv      <- ler("cv_detalhe.csv")
+cv_res  <- ler("cv_resumo.csv")
+cv_dif  <- ler("cv_diferenca.csv")
+coefs   <- ler("coeficientes.csv")
+met     <- ler("metricas.csv")
+faixas  <- ler("faixas_score_teste.csv")
+score_t <- ler("scorecard.csv")
+psi     <- ler("psi.csv")$psi_treino_teste
+
+# Formatação brasileira para números no texto
+num <- function(x, d = 3) formatC(x, format = "f", digits = d, decimal.mark = ",")
+pct <- function(x, d = 1) paste0(formatC(100 * x, format = "f", digits = d,
+                                         decimal.mark = ","), "%")
+m <- function(base, col) met[met$base == base, col]
+ic <- function(col) gsub("\\.", ",", m("teste", col))
+# intervalo do KS em percentual, para ficar na mesma unidade do KS
+ic_pct <- function(txt) sapply(txt, function(t) {
+  if (is.na(t)) return("")
+  v <- as.numeric(strsplit(t, " a ")[[1]])
+  paste(pct(v[1]), "a", pct(v[2]))
+}, USE.NAMES = FALSE)
+
+tema <- theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), plot.title.position = "plot",
+        legend.position = "top")
+cor_bom <- "#2E7D6B"; cor_mau <- "#C8102E"; cor_neutra <- "#8A8F98"
+
+criadas_fortes <- sum(iv$origem == "criada" & iv$iv >= 0.10)
+vitorias_auc   <- cv_dif$repeticoes_em_que_B_venceu[cv_dif$metrica == "AUC"]
+dif_auc        <- cv_dif$diferenca_media[cv_dif$metrica == "AUC"]
+usou_criadas   <- any(pipe$vars %in% vars_criadas)
+```
+
+## Resumo {.unnumbered}
+
+Este relatório documenta um modelo de risco de crédito construído na base pública German Credit, com `r nrow(dados)` contratos e `r pct(mean(dados$mau), 0)` de maus pagadores. O modelo é uma regressão logística sobre variáveis transformadas em WoE, selecionadas por IV, e avaliada por AUC e KS.
+
+No teste, o modelo atingiu **AUC de `r num(m("teste", "AUC"))`** (intervalo de 95%: `r ic("AUC_ic95")`) e **KS de `r pct(m("teste", "KS"))`** (intervalo de 95%: `r ic_pct(m("teste", "KS_ic95"))`). A faixa de menor score tem `r pct(faixas$taxa_maus[1], 0)` de maus e a de maior score tem `r pct(faixas$taxa_maus[nrow(faixas)], 0)`.
+
+Foram criadas `r length(vars_criadas)` variáveis novas. `r criadas_fortes` delas têm IV acima de 0,10, mas na validação cruzada o modelo com elas ficou `r num(abs(dif_auc))` de AUC `r ifelse(dif_auc < 0, "abaixo", "acima")` do modelo só com as variáveis originais e venceu em `r vitorias_auc` de `r max(cv$rep)` repetições. `r ifelse(usou_criadas, "Pela regra definida antes de abrir o teste, o modelo final inclui as variáveis criadas.", "Pela regra definida antes de abrir o teste, o modelo final usa só as variáveis originais.")`
+
+## Problema e dados
+
+O objetivo é estimar, no momento do pedido, a probabilidade de um cliente se tornar mau pagador. O alvo é `mau = 1` quando o contrato foi classificado como ruim na base e `0` caso contrário.
+
+A base tem 20 variáveis, todas disponíveis no momento da decisão. Duas foram excluídas antes de qualquer análise por serem atributos protegidos: `estado_civil_sexo` e `trabalhador_estrangeiro`. Negar crédito com base nelas é discriminação, e esse filtro vem antes de qualquer métrica. A variável `idade` foi mantida por ser prática comum em crédito, o que é uma escolha discutível.
+
+A base foi dividida em treino (70%) e teste (30%) por sorteio estratificado. O teste só é usado na avaliação final. Tudo o que aprende com os dados (faixas, WoE, escolha de variáveis e coeficientes) é ajustado apenas no treino.
+
+```{r}
+#| label: tbl-bases
+#| tbl-cap: "Tamanho e taxa de maus por base"
+tab <- do.call(rbind, lapply(split(dados, dados$base), function(d)
+  data.frame(Base = d$base[1], Contratos = nrow(d), Maus = sum(d$mau),
+             `Taxa de maus` = pct(mean(d$mau)), check.names = FALSE)))
+tab <- tab[c("treino", "teste"), ]
+rownames(tab) <- NULL
+knitr::kable(tab, align = "lrrr")
+```
+
+## Criação de variáveis
+
+O modelo trabalha com faixas, então uma transformação monótona de uma única variável não acrescenta nada: `log(valor)` gera as mesmas faixas que `valor`. Só traz informação nova quem combina variáveis ou reagrupa categorias com conhecimento de negócio. A @tbl-features lista as variáveis criadas.
+
+| Variável | Construção | Hipótese |
+|:---|:---|:---|
+| `parcela_mensal` | valor ÷ prazo | o que pesa no bolso é a parcela, não o total |
+| `valor_por_idade` | valor ÷ idade | dívida grande cedo na vida é mais arriscada |
+| `prazo_por_idade` | prazo ÷ idade | compromisso longo com pouco histórico |
+| `carga_total` | taxa da parcela na renda × prazo | comprometimento sustentado por muito tempo |
+| `liquidez` | conta corrente × poupança | conta negativa e sem reserva é pior que cada um sozinho |
+| `finalidade_grupo` | 10 finalidades em 5 grupos | categorias pequenas são instáveis |
+| `estabilidade` | emprego longo + casa própria + residência longa | vínculos sinalizam estabilidade |
+
+: Variáveis criadas {#tbl-features}
+
+```{r}
+#| label: codigo-features
+#| eval: false
+#| code-fold: false
+# Trecho de R/02_features.R
+d$parcela_mensal  <- d$valor_credito / d$prazo_meses
+d$valor_por_idade <- d$valor_credito / d$idade
+d$prazo_por_idade <- d$prazo_meses / d$idade
+d$carga_total     <- d$taxa_parcela * d$prazo_meses
+d$liquidez        <- paste(conta, reserva, sep = " | ")
+```
+
+## Binning, WoE e IV
+
+Cada variável é cortada em faixas. As numéricas começam em cinco faixas de mesmo tamanho e as categóricas com uma faixa por categoria. Faixas com menos de 5% da amostra, ou sem bons ou sem maus, são fundidas com a de taxa de maus mais parecida. Nas numéricas exige-se ainda que a taxa de maus só suba ou só desça ao longo das faixas, porque zigue-zague em amostra pequena quase sempre é ruído e uma regra não monótona não se explica a um cliente.
+
+O WoE (Weight of Evidence) de uma faixa compara a concentração de bons e de maus nela:
+
+$$
+\text{WoE}_j = \ln\left(\frac{\%\,\text{dos bons na faixa } j}{\%\,\text{dos maus na faixa } j}\right)
+$$
+
+WoE positivo indica que a faixa concentra bons pagadores, e negativo que concentra maus. Cada variável é substituída pelo WoE da faixa, o que coloca tudo na escala de log-chances, trata não linearidade e absorve valores extremos.
+
+O IV (Information Value) resume a força da variável inteira:
+
+$$
+\text{IV} = \sum_j \left(\%\,\text{bons}_j - \%\,\text{maus}_j\right)\times \text{WoE}_j
+$$
+
+A régua usual é: abaixo de 0,02 inútil, de 0,02 a 0,10 fraca, de 0,10 a 0,30 média, de 0,30 a 0,50 forte, e acima de 0,50 boa demais, o que pede investigação.
+
+```{r}
+#| label: fig-iv
+#| fig-cap: "Information Value por variável na base de treino. Linhas tracejadas em 0,02, 0,10 e 0,30."
+#| fig-height: 6.5
+ggplot(iv, aes(x = iv, y = reorder(variavel, iv), fill = origem)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = c(0.02, 0.1, 0.3), linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = c(original = cor_neutra, criada = cor_mau), name = NULL) +
+  labs(x = "IV", y = NULL) + tema
+```
+
+```{r}
+#| label: iv-texto
+#| include: false
+iv_conta   <- iv$iv[iv$variavel == "conta_corrente"]
+iv_liq     <- iv$iv[iv$variavel == "liquidez"]
+n_inuteis  <- sum(iv$iv < 0.02)
+tx <- function(v, padrao) {
+  t <- woe_tab[woe_tab$variavel == v, ]
+  t$taxa_maus[grepl(padrao, t$faixa)][1]
+}
+```
+
+Três pontos se destacam na @fig-iv. Primeiro, `conta_corrente` (IV de `r num(iv_conta, 2)`) e `liquidez` (`r num(iv_liq, 2)`) passam de 0,50. Não é vazamento, porque o saldo em conta é conhecido na hora do pedido, mas o padrão é estranho: clientes sem conta corrente são o grupo mais seguro, com `r pct(tx("conta_corrente", "sem conta"), 0)` de maus, e em `historico_credito` quem tem todos os créditos quitados é o pior grupo, com `r pct(tx("historico_credito", "quitados"), 0)` de maus. São peculiaridades conhecidas dessa base, cuja documentação original dos códigos é questionada na literatura. Num projeto real, um WoE que contraria a lógica de negócio é motivo para questionar o dado antes de modelar.
+
+Segundo, `r n_inuteis` variáveis ficaram abaixo de 0,02 e são descartadas. Terceiro, `r criadas_fortes` das variáveis criadas têm IV acima de 0,10.
+
+```{r}
+#| label: fig-woe
+#| fig-cap: "WoE por faixa das seis variáveis de maior IV. À direita do zero a faixa concentra bons pagadores."
+#| fig-width: 11
+#| fig-height: 8
+top   <- head(iv$variavel[order(-iv$iv)], 6)
+d_top <- woe_tab[woe_tab$variavel %in% top, ]
+d_top$variavel <- factor(d_top$variavel, levels = top)
+d_top$rotulo <- ifelse(nchar(d_top$faixa) > 34,
+                       paste0(substr(d_top$faixa, 1, 32), "…"), d_top$faixa)
+d_top$id <- factor(seq_len(nrow(d_top)))
+ggplot(d_top, aes(x = woe, y = id, fill = woe > 0)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_vline(xintercept = 0, colour = "grey30") +
+  scale_y_discrete(labels = setNames(d_top$rotulo, d_top$id)) +
+  scale_fill_manual(values = c(`TRUE` = cor_bom, `FALSE` = cor_mau)) +
+  facet_wrap(~variavel, scales = "free_y", ncol = 2) +
+  labs(x = "WoE = ln(% bons / % maus)", y = NULL) + tema
+```
+
+## As variáveis criadas ajudam?
+
+O IV mede cada variável sozinha. O que interessa ao modelo é o ganho incremental, e esse só aparece comparando modelos. Com `r nrow(treino)` linhas de treino, um único corte de validação é ruído, então a comparação usa `r max(cv$dobra)` dobras repetidas `r max(cv$rep)` vezes. Em cada dobra o pipeline inteiro é refeito do zero, e os dois cenários usam as mesmas dobras.
+
+```{r}
+#| label: tbl-cv
+#| tbl-cap: "Validação cruzada repetida no treino"
+t <- data.frame(
+  Cenário = cv_res$cenario,
+  `AUC médio` = num(cv_res$AUC_media), `Desvio AUC` = num(cv_res$AUC_dp),
+  `KS médio` = pct(cv_res$KS_media), `Desvio KS` = paste(num(100 * cv_res$KS_dp, 1), "p.p."),
+  `Variáveis no modelo (média)` = num(cv_res$n_vars_medio, 1),
+  check.names = FALSE)
+knitr::kable(t, align = "lrrrrr")
+```
+
+```{r}
+#| label: fig-cv
+#| fig-cap: "Diferença de AUC entre os cenários (B menos A) em cada repetição da validação cruzada. Acima de zero, as variáveis criadas ajudaram."
+#| fig-height: 3.8
+a <- cv[grepl("^A", cv$cenario), ]; b <- cv[grepl("^B", cv$cenario), ]
+d <- data.frame(rep = factor(sort(unique(a$rep))),
+                dif = as.numeric(tapply(b$AUC - a$AUC, a$rep, mean)))
+ggplot(d, aes(rep, dif, fill = dif > 0)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  scale_fill_manual(values = c(`TRUE` = cor_bom, `FALSE` = cor_mau)) +
+  labs(x = "Repetição", y = "Diferença de AUC (B − A)") + tema
+```
+
+O cenário com as variáveis criadas venceu em AUC em `r vitorias_auc` de `r max(cv$rep)` repetições, com diferença média de `r sub("-", "−", num(dif_auc))`. A regra, escrita no código antes de rodar o teste, era adotar as variáveis criadas apenas se vencessem em pelo menos 8 de 10 repetições. O cenário escolhido foi **`r pipe$cenario`**.
+
+A explicação é que `liquidez` combina `conta_corrente` e `poupanca`, e seu IV alto é quase todo o IV que as duas já entregavam. Além disso, a base tem apenas 20 atributos já resumidos por cliente. Criação de variáveis rende quando há dado bruto para agregar, como transações, histórico de parcelas e consultas a bureau.
+
+O desvio do KS entre dobras também merece atenção: com essa amostra, uma diferença de um ou dois pontos de KS não se distingue de sorte.
+
+## Modelo final
+
+A seleção de variáveis aplica quatro filtros em sequência: IV mínimo de 0,02; entre pares com correlação acima de 0,7, fica a de maior IV; eliminação para trás até todas terem p-valor abaixo de 0,05; e exigência de coeficiente negativo. Como WoE alto significa mais bons e o alvo é o mau pagador, um sinal positivo indica que a variável está corrigindo outra em vez de medir risco.
+
+$$
+\ln\left(\frac{P(\text{mau})}{P(\text{bom})}\right) = \beta_0 + \beta_1\,\text{WoE}(x_1) + \dots + \beta_k\,\text{WoE}(x_k)
+$$
+
+```{r}
+#| label: tbl-coefs
+#| tbl-cap: "Coeficientes do modelo final"
+t <- data.frame(
+  Termo = coefs$termo,
+  Coeficiente = num(coefs$coeficiente, 2),
+  `Erro padrão` = num(coefs$erro_padrao, 2),
+  `p-valor` = ifelse(coefs$p_valor < 0.001, "< 0,001", num(coefs$p_valor)),
+  IV = ifelse(is.na(coefs$iv), "", num(coefs$iv)),
+  check.names = FALSE)
+knitr::kable(t, align = "lrrrr")
+```
+
+A regressão logística foi escolhida porque em crédito o modelo precisa ser explicado ao regulador e ao cliente recusado, e porque com mil linhas um modelo mais complexo teria pouco dado para justificar o ganho.
+
+## Avaliação no teste
+
+```{r}
+#| label: tbl-metricas
+#| tbl-cap: "Métricas no treino e no teste. Intervalos de 95% por bootstrap com 2.000 reamostragens."
+t <- data.frame(
+  Base = met$base, AUC = num(met$AUC), Gini = num(met$Gini), KS = pct(met$KS),
+  `IC 95% do AUC` = ifelse(is.na(met$AUC_ic95), "", gsub("\\.", ",", met$AUC_ic95)),
+  `IC 95% do KS`  = ic_pct(met$KS_ic95),
+  check.names = FALSE)
+knitr::kable(t, align = "lrrrrr")
+```
+
+O AUC é a probabilidade de o modelo atribuir mais risco a um mau do que a um bom sorteados ao acaso, e o Gini é 2 × AUC − 1. O KS é a maior distância entre as curvas acumuladas de maus e de bons ao longo do score.
+
+```{r}
+#| label: scores
+teste$p_mau  <- prever(pipe, teste)
+treino$p_mau <- prever(pipe, treino)
+pdo <- 20; fator <- pdo / log(2); offset <- 600 - fator * log(50)
+para_score <- function(p) offset + fator * log((1 - p) / p)
+teste$score <- para_score(teste$p_mau); treino$score <- para_score(treino$p_mau)
+```
+
+```{r}
+#| label: fig-ks
+#| fig-cap: "Curva KS no teste: proporção acumulada de maus e de bons até cada score."
+s <- sort(unique(teste$score))
+d <- data.frame(score = s, maus = ecdf(teste$score[teste$mau == 1])(s),
+                bons = ecdf(teste$score[teste$mau == 0])(s))
+i <- which.max(abs(d$maus - d$bons))
+ggplot(d, aes(score)) +
+  geom_line(aes(y = maus, colour = "Maus"), linewidth = 1) +
+  geom_line(aes(y = bons, colour = "Bons"), linewidth = 1) +
+  annotate("segment", x = d$score[i], xend = d$score[i], y = d$bons[i],
+           yend = d$maus[i], linetype = "dashed") +
+  annotate("label", x = d$score[i], y = mean(c(d$bons[i], d$maus[i])),
+           label = paste("KS =", pct(d$maus[i] - d$bons[i])), hjust = -0.1) +
+  scale_colour_manual(values = c(Maus = cor_mau, Bons = cor_bom), name = NULL) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Score", y = "Proporção acumulada") + tema
+```
+
+```{r}
+#| label: fig-roc
+#| fig-cap: "Curva ROC no teste."
+#| fig-width: 5.5
+#| fig-height: 5.5
+r <- pROC::roc(teste$mau, teste$p_mau, quiet = TRUE, direction = "<")
+d <- data.frame(fpr = 1 - r$specificities, tpr = r$sensitivities)
+d <- d[order(d$fpr, d$tpr), ]
+ggplot(d, aes(fpr, tpr)) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_line(colour = cor_mau, linewidth = 1) + coord_equal() +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Bons classificados como maus", y = "Maus capturados") + tema
+```
+
+Mais importante que o número único é a ordenação do risco por faixa de score.
+
+```{r}
+#| label: fig-faixas
+#| fig-cap: "Taxa de maus por faixa de score no teste. Faixas definidas pelos quintis do treino; a linha tracejada é a taxa média."
+faixas$faixa_score <- factor(faixas$faixa_score, levels = faixas$faixa_score)
+ggplot(faixas, aes(faixa_score, taxa_maus)) +
+  geom_col(fill = cor_mau, width = 0.65) +
+  geom_text(aes(label = paste0(pct(taxa_maus, 0), "\n(n=", n, ")")),
+            vjust = -0.2, size = 3.6) +
+  geom_hline(yintercept = mean(teste$mau), linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.2))) +
+  labs(x = "Faixa de score (maior = menos risco)", y = "Taxa de maus") + tema
+```
+
+```{r}
+#| label: faixas-texto
+#| include: false
+pop2  <- sum(faixas$n[1:2]) / sum(faixas$n)
+maus2 <- faixas$pct_maus_acum[2]
+```
+
+As duas faixas de menor score reúnem `r pct(pop2, 0)` dos clientes e `r pct(maus2, 0)` dos maus. As taxas de maus dessas duas faixas são `r pct(faixas$taxa_maus[1])` e `r pct(faixas$taxa_maus[2])`: `r ifelse(abs(faixas$taxa_maus[1] - faixas$taxa_maus[2]) < 0.03, "o modelo praticamente não distingue o cliente ruim do muito ruim, o que é uma fraqueza real.", "há separação entre elas.")`
+
+O PSI do score entre treino e teste é `r num(psi)`. Valores abaixo de 0,10 indicam distribuição estável. Em produção, é o indicador acompanhado mês a mês para saber quando o modelo envelheceu.
+
+## Scorecard
+
+A probabilidade é convertida em pontos por uma convenção de mercado: 600 pontos equivalem a 50 bons para 1 mau, e a cada 20 pontos a chance de ser bom dobra.
+
+$$
+\text{score} = \text{offset} + \text{fator}\times\ln\left(\frac{P(\text{bom})}{P(\text{mau})}\right),\qquad
+\text{fator} = \frac{20}{\ln 2},\qquad \text{offset} = 600 - \text{fator}\times\ln 50
+$$
+
+Como o modelo é linear em WoE, o score se decompõe em pontos por faixa. Somando os pontos das `r length(pipe$vars)` variáveis chega-se ao score do cliente, e uma recusa pode ser explicada apontando as faixas que mais tiraram pontos.
+
+```{r}
+#| label: tbl-scorecard
+#| tbl-cap: "Scorecard: pontos por faixa de cada variável"
+t <- data.frame(Variável = score_t$variavel, Faixa = score_t$faixa,
+                `Contratos no treino` = score_t$n_treino,
+                `Taxa de maus` = pct(score_t$taxa_maus),
+                WoE = num(score_t$woe, 2), Pontos = score_t$pontos,
+                check.names = FALSE)
+knitr::kable(t, align = "llrrrr")
+```
+
+```{r}
+#| label: fig-dist
+#| fig-cap: "Distribuição do score por classe no teste."
+teste$classe <- ifelse(teste$mau == 1, "Maus", "Bons")
+ggplot(teste, aes(score, fill = classe)) +
+  geom_density(alpha = 0.55, colour = NA) +
+  scale_fill_manual(values = c(Maus = cor_mau, Bons = cor_bom), name = NULL) +
+  labs(x = "Score", y = "Densidade") + tema
+```
+
+## Limitações
+
+A amostra é pequena. O teste tem `r nrow(teste)` contratos e `r sum(teste$mau)` maus, e o intervalo de 95% do KS vai de `r ic_pct(m("teste", "KS_ic95"))`, de modo que o número pontual sozinho diz pouco.
+
+Há sobreajuste moderado: o AUC é de `r num(m("treino", "AUC"))` no treino e de `r num(m("teste", "AUC"))` no teste. Parte disso vem do binning supervisionado em base pequena.
+
+O teste foi visto mais de uma vez. Durante o desenvolvimento, antes de a regra de escolha entrar no código, o cenário com as variáveis criadas foi avaliado no teste e atingiu AUC de 0,759. A diferença está dentro do intervalo de confiança, e a escolha seguiu a validação cruzada. Trocar de modelo por causa desse número seria escolher o modelo pelo teste.
+
+Não há dimensão temporal. Um modelo de crédito real é validado em safra posterior, e a base não tem data. Também só há clientes aprovados, de modo que quem foi recusado não aparece.
+
+Os dados são de 1994, em marcos alemães, e a documentação dos códigos é questionada. A base serve para demonstrar método, não para conclusões sobre crédito.
+
+O custo assimétrico foi ignorado. A documentação sugere que aprovar um mau custa cinco vezes mais que recusar um bom, o que afetaria o ponto de corte, que este trabalho não define.
+
+## Próximos passos
+
+Repetir o pipeline na base Home Credit, com 307 mil contratos e tabelas de histórico de parcelas e de bureau, onde a criação de variáveis por agregação tem espaço para mostrar ganho, e comparar a regressão logística com um gradient boosting como referência de teto.
+
+## Reprodutibilidade {.unnumbered}
+
+```{r}
+#| label: sessao
+#| code-fold: false
+sessionInfo()
+```
